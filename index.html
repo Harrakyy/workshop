@@ -364,7 +364,7 @@ body[data-gaya=ceria]{--paper:#fff7e8;--card:#fff;--ink:#2a2140;--soft:#6b6180;-
       <p class="small">Belum punya? <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" style="color:var(--red);font-weight:700">Bikin gratis di AI Studio</a> (login Google, klik Create API key).</p>
       <label class="ck" style="margin-top:6px"><input type="checkbox" id="remember"><span><b>Ingat key di browser ini</b><small>Matikan kalau pakai komputer umum</small></span></label>
       <label class="f" for="model">Model</label>
-      <select id="model"><option value="gemini-flash-latest">Gemini Flash (terbaru)</option><option value="gemini-3.5-flash">Gemini 3.5 Flash</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite (paling hemat)</option></select>
+      <select id="model"><option value="gemini-flash-lite-latest">Gemini Flash-Lite (paling cepat &amp; hemat)</option><option value="gemini-flash-latest">Gemini Flash (lebih pintar, lebih lama)</option></select>
       <label class="f" for="docIn">Dokumen sumber</label>
       <textarea id="docIn" placeholder="Tempel isi dokumen di sini, atau pilih file di bawah"></textarea>
       <div class="row" style="margin-top:8px">
@@ -682,13 +682,28 @@ function ask(opts,withText){
       a.remove();pend=null;res({i,text:tx?tx.value.trim():""});});
   });
 }
-async function gem(contents,{system,search=false,json=false}={}){
-  const body={contents,systemInstruction:{parts:[{text:system}]},generationConfig:{temperature:json?0.2:0.7}};
+async function gem(contents,{system,search=false,json=false,onText=null}={}){
+  const body={contents,systemInstruction:{parts:[{text:system}]}};
   if(search)body.tools=[{googleSearch:{}}];
-  if(json)body.generationConfig.responseMimeType="application/json";
+  if(json)body.generationConfig={responseMimeType:"application/json"};
+  const stream=!!onText;
   let res;
-  try{res=await fetch(API+encodeURIComponent($("model").value)+":generateContent",{method:"POST",headers:{"Content-Type":"application/json","x-goog-api-key":$("key").value.trim()},body:JSON.stringify(body),signal:ctrl.signal});}
+  try{res=await fetch(API+encodeURIComponent($("model").value)+(stream?":streamGenerateContent?alt=sse":":generateContent"),{method:"POST",headers:{"Content-Type":"application/json","x-goog-api-key":$("key").value.trim()},body:JSON.stringify(body),signal:ctrl.signal});}
   catch(e){if(e.name==="AbortError")throw e;throw new Error("Nggak bisa nyambung ke Gemini. Cek internet. Kalau halaman ini dibuka di dalam Claude, koneksi keluar memang diblokir: buka versi yang di-host atau file HTML-nya langsung.");}
+  if(stream&&res.ok){
+    const rd=res.body.getReader(),de=new TextDecoder();let buf="",text="",links=[],fin="",last=0;
+    for(;;){const {done,value}=await rd.read();if(done)break;buf+=de.decode(value,{stream:true});
+      let k;while((k=buf.indexOf("\n\n"))>=0){const ev=buf.slice(0,k);buf=buf.slice(k+2);
+        for(const ln of ev.split("\n")){if(!ln.startsWith("data:"))continue;let j;try{j=JSON.parse(ln.slice(5));}catch(e){continue;}
+          const c=(j.candidates||[])[0];if(!c)continue;
+          text+=((c.content||{}).parts||[]).filter(p=>!p.thought).map(p=>p.text||"").join("");
+          const g=(c.groundingMetadata||{}).groundingChunks;if(g)links=g.map(x=>x.web).filter(Boolean);
+          if(c.finishReason)fin=c.finishReason;}}
+      const now=Date.now();if(now-last>120){last=now;onText(text);}}
+    text=text.trim();
+    if(!text)throw new Error("Gemini nggak ngasih jawaban"+(fin?" ("+fin+")":"")+". Coba lagi.");
+    onText(text);return{text,links};
+  }
   let data={};try{data=await res.json();}catch(e){}
   if(!res.ok){const m=(data.error&&data.error.message)||"";
     if(res.status===429)throw new Error("Kuota gratis lagi penuh. Tunggu sekitar 1 menit, lalu klik Jalankan Agent lagi.");
@@ -698,7 +713,7 @@ async function gem(contents,{system,search=false,json=false}={}){
     throw new Error("Gemini menolak permintaan ("+res.status+"). "+m.slice(0,200));}
   const c=(data.candidates||[])[0];
   if(!c||!c.content)throw new Error("Gemini nggak ngasih jawaban"+(c&&c.finishReason?" ("+c.finishReason+")":"")+". Coba lagi.");
-  const text=(c.content.parts||[]).map(p=>p.text||"").join("").trim();
+  const text=(c.content.parts||[]).filter(p=>!p.thought).map(p=>p.text||"").join("").trim();
   const links=((c.groundingMetadata||{}).groundingChunks||[]).map(g=>g.web).filter(Boolean);
   return{text,links,content:c.content};
 }
@@ -706,7 +721,7 @@ function docPart(){return pdf?{inlineData:{mimeType:"application/pdf",data:pdf.d
 async function turn(hist,title,msg,opt,pre=""){
   hist.push({role:"user",parts:[{text:msg}]});
   const c=card2(title);c.body.innerHTML=pre+'<p class="small">Agent lagi mikir...</p>';
-  try{const r=await gem(hist,opt);hist.push({role:"model",parts:[{text:r.text}]});c.done(pre+md(r.text));return{r,c};}
+  try{const r=await gem(hist,{...opt,onText:t=>{c.body.innerHTML=pre+md(t);const lg=$("log");lg.scrollTop=lg.scrollHeight;}});hist.push({role:"model",parts:[{text:r.text}]});c.done(pre+md(r.text));return{r,c};}
   catch(e){hist.pop();if(e.name!=="AbortError")c.err(e.message);throw e;}
 }
 async function check(s,draft){
@@ -725,11 +740,11 @@ async function draftLoop(s,hist,sys,first){
   wf("draf","on","<b>Draf:</b> agent menulis konten sesuai format.");
   let {r}=await turn(hist,"Draf",first,{system:sys});
   for(let round=1;;round++){
-    await sleep(800);
+    
     const j=await check(s,r.text);
     if(!j.perlu_perbaikan||round>2){wf("cek","done");break;}
     wf("cek","done");wf("fix","on","<b>Loop:</b> ada aturan yang belum lolos, agent memutuskan memperbaiki sendiri.");wfLoop(round);
-    await sleep(800);
+    
     ({r}=await turn(hist,`Memperbaiki sendiri (putaran ${round})`,`Hasil pemeriksaan: ${j.catatan||"ada aturan yang belum lolos"}. Perbaiki draf dan tampilkan versi lengkap yang sudah diperbaiki.`,{system:sys},'<span class="tool">Agent memutuskan: revisi sendiri</span>'));
     wf("fix","done");wf("draf","done");
   }
@@ -749,12 +764,12 @@ async function runAgent(){
       wf("plan","done");wf("ok1","on","<b>Giliran kamu:</b> setujui rencananya atau minta ubah.");
       const a=await ask(["Lanjut","Ubah rencana"],"Mau ubah apa? (isi kalau pilih Ubah rencana)");
       wf("ok1","done");if(a.i===0)break;msg=`Ubah rencana: ${a.text}. Tulis ulang rencananya (Langkah 1).`;}
-    await sleep(600);
+    
     wf("riset","on","<b>Riset:</b> agent mengumpulkan fakta"+(web?" dan memutuskan perlu Google Search atau nggak.":" dari dokumen."));if(web)wf("web","on");
     const {r,c}=await turn(hist,"Riset","Lanjut. Kerjakan Langkah 2 — RISET sekarang."+(web?" Putuskan sendiri apakah perlu mencari di web untuk mengecek atau melengkapi.":""),{system:sys,search:web});
     wf("riset","done");if(web)wf("web",r.links.length?"done":null);
     if(web){c.body.insertAdjacentHTML("afterbegin",r.links.length?`<span class="tool">Pakai alat: Cari di web</span><ol class="links">${r.links.map(l=>`<li><a href="${esc(l.uri)}" target="_blank" rel="noopener">${esc(l.title||l.uri)}</a></li>`).join("")}</ol>`:`<span class="tool" style="background:var(--soft)">Agent memutuskan: nggak perlu cari di web</span>`);}
-    await sleep(600);
+    
     await draftLoop(s,hist,sys,"Kerjakan Langkah 3 — DRAF sekarang, ikuti FORMAT OUTPUT.");
     for(;;){wf("ok2","on","<b>Giliran kamu:</b> Setuju atau Revisi?");const a=await ask(["Setuju","Revisi"],"Kalau Revisi, tulis apa yang mau diubah");
       wf("ok2","done");if(a.i===0)break;
